@@ -1,0 +1,444 @@
+---
+title: "CPD ISR — Unit 189 (Narcotics) 2016 Pipeline for Shiny"
+author: "Devin Rooney"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: united
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 6, cache = FALSE
+)
+```
+
+# Overview
+
+End-to-end pipeline from raw ISR parquet to a single `.rds` file consumed
+by the Shiny app. Runs start-to-finish in a fresh R session.
+
+Pipeline steps:
+
+1. Load and deduplicate ISR stops
+2. Load CPD beat shapefile (used for ungeocoded stop salvage)
+3. Impute reliable event IDs
+4. Salvage ungeocoded stops via BEAT match
+5. Filter to Unit 189 (Narcotics), 2016
+6. Build officer co-event network (NODES, EDGE_CONTRIBS)
+7. Build per-officer-per-stop scope table (SCOPE_FOR_SHINY)
+8. Save consolidated `.rds`
+
+---
+
+# Section 1: Setup
+
+```{r setup-packages}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(arrow)
+  library(sf)
+  library(igraph)
+})
+
+options(tigris_use_cache = TRUE, scipen = 999)
+set.seed(1848)
+
+# --- Paths ---
+DIR_DATA   <- "../data"
+DIR_SHINY  <- "shiny_app"
+dir.create(DIR_SHINY, showWarnings = FALSE, recursive = TRUE)
+
+BEATS_PATH <- file.path(DIR_DATA, "CPD_beats.geojson")
+
+# --- Constants ---
+CRS_PROJ <- 26971       # NAD83 / Illinois East (ftUS)
+
+# Event imputation parameters
+WINDOW_SEC <- 30 * 60   # 30 minutes
+RADIUS_FT  <- 250       # 250 feet
+
+# Scope parameters
+UNIT_ID            <- "189"                                 # Narcotics
+SCOPE_START        <- as.POSIXct("2016-01-01", tz = "UTC")
+SCOPE_END          <- as.POSIXct("2017-01-01", tz = "UTC")  # exclusive
+EDGE_DURATION_DAYS <- 14
+EDGE_DURATION_SEC  <- EDGE_DURATION_DAYS * 86400
+CORE_MIN           <- 10                                    # tier classification
+```
+
+---
+
+# Section 2: Load ISR
+
+```{r s01-load-isr}
+message("Stage 1: loading and deduplicating ISR parquet...")
+
+ISR <- read_parquet(file.path(DIR_DATA, "ISR_2016_2023.parquet"))
+
+ISR <- ISR |>
+  mutate(
+    DISTRICT = str_pad(as.character(DISTRICT), 2, "left", "0"),
+    RACE = case_when(
+      RACE_CODE_CD == "WHI" ~ "WHT",
+      TRUE ~ RACE_CODE_CD
+    ),
+    YEAR       = as.integer(format(CONTACT_DATE, "%Y")),
+    HIT        = as.integer(SEARCH_CONTRABAND_FOUND_I == "Y"),
+    SEARCHED   = as.integer(SEARCH_I == "Y"),
+    OFFICER_ID = as.character(FO_EMPLOYEE_ID)
+  )
+
+# Keep only the latest row per CARD_NO (some have revisions)
+ISR <- ISR |>
+  group_by(CARD_NO) |>
+  slice_tail(n = 1) |>
+  ungroup()
+
+ISR <- ISR |>
+  mutate(
+    BEAT_PAD     = str_pad(as.character(BEAT),     4, "left", "0"),
+    RES_BEAT_PAD = str_pad(as.character(RES_BEAT), 4, "left", "0")
+  )
+
+# Count how many stops share each EVENT_NO (for clustering decisions)
+EVENT_COUNTS <- ISR |>
+  filter(!is.na(EVENT_NO), EVENT_NO != "") |>
+  count(EVENT_NO, name = "N_STOPS_IN_EVENT")
+
+ISR <- ISR |>
+  left_join(EVENT_COUNTS, by = "EVENT_NO") |>
+  mutate(N_STOPS_IN_EVENT = replace_na(N_STOPS_IN_EVENT, 1L))
+```
+
+```{r s02-load-beats}
+message("Stage 2: loading beat shapefile...")
+
+BEATS <- st_read(BEATS_PATH, quiet = TRUE) |>
+  st_transform(CRS_PROJ) |>
+  mutate(BEAT = str_pad(as.character(beat_num), 4, "left", "0")) |>
+  filter(!substr(BEAT, 1, 2) %in% c("31", "41", "51")) |>
+  select(BEAT, geometry) |>
+  st_make_valid()
+
+stopifnot(anyDuplicated(BEATS$BEAT) == 0)
+```
+
+---
+
+# Section 3: Event ID imputation
+
+The raw `EVENT_NO` is unreliable: short codes like "00059" and "00000"
+are reused across unrelated stops. Cluster stops sharing the same
+`EVENT_NO` that fall within 250 ft and 30 min of each other (single-
+linkage). For stops with missing `EVENT_NO`, substitute
+`SUPV_EMPLOYEE_ID` as the grouping key.
+
+```{r s03-project-and-flag}
+message("Stage 3: projecting geocoded stops and flagging missing IDs...")
+
+cluster_event <- function(df, radius_ft, window_sec) {
+  n <- nrow(df)
+  if (n == 1) return(1L)
+  dx <- outer(df$X, df$X, "-")
+  dy <- outer(df$Y, df$Y, "-")
+  dist_mat <- sqrt(dx^2 + dy^2)
+  time_mat <- abs(outer(as.numeric(df$CONTACT_DATE),
+                        as.numeric(df$CONTACT_DATE), "-"))
+  adj <- (dist_mat <= radius_ft) & (time_mat <= window_sec)
+  g <- graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE)
+  components(g)$membership
+}
+
+ISR_PROJ <- ISR |>
+  filter(!is.na(lat), !is.na(long)) |>
+  st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE) |>
+  st_transform(CRS_PROJ)
+
+coords <- st_coordinates(ISR_PROJ)
+ISR_PROJ <- ISR_PROJ |>
+  st_drop_geometry() |>
+  mutate(X = coords[, 1], Y = coords[, 2])
+
+ISR_PROJ <- ISR_PROJ |>
+  mutate(EVENT_MISSING = is.na(EVENT_NO) | EVENT_NO == "" | EVENT_NO == "00000")
+
+message("  Real EVENT_NO stops: ", sum(!ISR_PROJ$EVENT_MISSING))
+message("  Missing-ID stops:    ", sum(ISR_PROJ$EVENT_MISSING))
+```
+
+```{r s04-cluster-real}
+message("Stage 4: clustering real EVENT_NO stops...")
+
+REAL_MULTI <- ISR_PROJ |>
+  filter(!EVENT_MISSING, N_STOPS_IN_EVENT > 1) |>
+  arrange(EVENT_NO, CONTACT_DATE) |>
+  group_by(EVENT_NO) |>
+  mutate(CLUSTER = cluster_event(pick(everything()),
+                                 RADIUS_FT, WINDOW_SEC)) |>
+  ungroup()
+
+REAL_MULTI <- REAL_MULTI |>
+  group_by(EVENT_NO) |>
+  mutate(N_CLUSTERS = n_distinct(CLUSTER)) |>
+  group_by(EVENT_NO, CLUSTER) |>
+  mutate(CLUSTER_FIRST_TIME = min(CONTACT_DATE)) |>
+  group_by(EVENT_NO) |>
+  mutate(CLUSTER_RANK = dense_rank(CLUSTER_FIRST_TIME),
+         SUFFIX = if_else(N_CLUSTERS == 1, "_0",
+                          paste0("_", CLUSTER_RANK)),
+         IMPUTED_EVENT_ID = paste0(EVENT_NO, SUFFIX)) |>
+  ungroup() |>
+  select(CARD_NO, IMPUTED_EVENT_ID)
+
+REAL_SINGLETON <- ISR_PROJ |>
+  filter(!EVENT_MISSING, N_STOPS_IN_EVENT == 1) |>
+  mutate(IMPUTED_EVENT_ID = paste0(EVENT_NO, "_0")) |>
+  select(CARD_NO, IMPUTED_EVENT_ID)
+```
+
+```{r s05-cluster-missing}
+message("Stage 5: clustering missing-ID stops via SUPV_EMPLOYEE_ID...")
+
+MISSING_NO_SUPV <- ISR_PROJ |>
+  filter(EVENT_MISSING, is.na(SUPV_EMPLOYEE_ID) | SUPV_EMPLOYEE_ID == "") |>
+  mutate(IMPUTED_EVENT_ID = paste0("NOEVENT_NOSUPV_", CARD_NO)) |>
+  select(CARD_NO, IMPUTED_EVENT_ID)
+
+MISSING_WITH_SUPV <- ISR_PROJ |>
+  filter(EVENT_MISSING,
+         !is.na(SUPV_EMPLOYEE_ID), SUPV_EMPLOYEE_ID != "") |>
+  arrange(SUPV_EMPLOYEE_ID, CONTACT_DATE) |>
+  group_by(SUPV_EMPLOYEE_ID) |>
+  mutate(CLUSTER = cluster_event(pick(everything()),
+                                 RADIUS_FT, WINDOW_SEC)) |>
+  ungroup()
+
+MISSING_WITH_SUPV <- MISSING_WITH_SUPV |>
+  group_by(SUPV_EMPLOYEE_ID, CLUSTER) |>
+  mutate(CLUSTER_FIRST_TIME = min(CONTACT_DATE),
+         CLUSTER_SIZE = n()) |>
+  group_by(SUPV_EMPLOYEE_ID) |>
+  mutate(CLUSTER_RANK = dense_rank(CLUSTER_FIRST_TIME)) |>
+  ungroup() |>
+  mutate(IMPUTED_EVENT_ID = if_else(
+    CLUSTER_SIZE == 1,
+    paste0("NOEVENT_", SUPV_EMPLOYEE_ID, "_S", CARD_NO),
+    paste0("NOEVENT_", SUPV_EMPLOYEE_ID, "_", CLUSTER_RANK)
+  )) |>
+  select(CARD_NO, IMPUTED_EVENT_ID)
+```
+
+```{r s06-combine}
+message("Stage 6: combining and attaching IMPUTED_EVENT_ID to ISR...")
+
+IMPUTED <- bind_rows(
+  REAL_MULTI,
+  REAL_SINGLETON,
+  MISSING_NO_SUPV,
+  MISSING_WITH_SUPV
+)
+
+NO_GEO <- ISR |>
+  anti_join(IMPUTED, by = "CARD_NO") |>
+  mutate(IMPUTED_EVENT_ID = paste0("NOGEO_", CARD_NO)) |>
+  select(CARD_NO, IMPUTED_EVENT_ID)
+
+IMPUTED <- bind_rows(IMPUTED, NO_GEO)
+
+stopifnot(nrow(IMPUTED) == nrow(ISR))
+stopifnot(anyDuplicated(IMPUTED$CARD_NO) == 0)
+
+ISR <- ISR |>
+  left_join(IMPUTED, by = "CARD_NO")
+
+message("  IMPUTED_EVENT_ID attached. Unique imputed events: ",
+        n_distinct(ISR$IMPUTED_EVENT_ID))
+```
+
+---
+
+# Section 4: Salvage ungeocoded stops via BEAT match
+
+Many ISR stops lack lat/long but have a BEAT and EVENT_NO. If a
+geocoded cluster shares the same EVENT_NO and BEAT and is within the
+30-min window, attach the ungeocoded stop to that cluster.
+
+```{r s07-find-matches}
+message("Stage 7: salvaging ungeocoded stops via BEAT match...")
+
+UNGEO_CANDIDATES <- ISR |>
+  filter((is.na(lat) | is.na(long)),
+         !is.na(EVENT_NO), EVENT_NO != "", EVENT_NO != "00000",
+         !is.na(BEAT_PAD), BEAT_PAD != "") |>
+  select(CARD_NO, EVENT_NO, CONTACT_DATE, BEAT_PAD,
+         IMPUTED_EVENT_ID_OLD = IMPUTED_EVENT_ID)
+
+GEOCODED_CLUSTERS <- ISR |>
+  filter(!is.na(lat), !is.na(long),
+         !str_starts(IMPUTED_EVENT_ID, "NOEVENT_"),
+         !str_starts(IMPUTED_EVENT_ID, "NOGEO_")) |>
+  select(EVENT_NO, IMPUTED_EVENT_ID, CONTACT_DATE, BEAT_PAD)
+
+MATCHES <- UNGEO_CANDIDATES |>
+  inner_join(GEOCODED_CLUSTERS,
+             by = c("EVENT_NO", "BEAT_PAD"),
+             suffix = c("_UG", "_GC"),
+             relationship = "many-to-many") |>
+  mutate(TIME_DIFF = abs(as.numeric(CONTACT_DATE_UG) -
+                         as.numeric(CONTACT_DATE_GC))) |>
+  filter(TIME_DIFF <= WINDOW_SEC)
+
+MATCHES_BY_CLUSTER <- MATCHES |>
+  group_by(CARD_NO, IMPUTED_EVENT_ID) |>
+  summarise(MIN_TIME_DIFF = min(TIME_DIFF), .groups = "drop")
+
+SALVAGE <- MATCHES_BY_CLUSTER |>
+  group_by(CARD_NO) |>
+  arrange(MIN_TIME_DIFF, IMPUTED_EVENT_ID) |>
+  slice_head(n = 1) |>
+  ungroup() |>
+  select(CARD_NO,
+         IMPUTED_EVENT_ID_NEW = IMPUTED_EVENT_ID)
+
+ISR <- ISR |>
+  left_join(SALVAGE, by = "CARD_NO") |>
+  mutate(
+    IMPUTED_EVENT_ID = if_else(!is.na(IMPUTED_EVENT_ID_NEW),
+                                IMPUTED_EVENT_ID_NEW,
+                                IMPUTED_EVENT_ID)
+  ) |>
+  select(-IMPUTED_EVENT_ID_NEW)
+
+message("  Final unique imputed events: ",
+        n_distinct(ISR$IMPUTED_EVENT_ID))
+```
+
+---
+
+# Section 5: Filter to scope
+
+```{r s09-scope}
+message("Stage 9: filtering to Unit ", UNIT_ID, ", ", format(SCOPE_START),
+        " to ", format(SCOPE_END), "...")
+
+SCOPE <- ISR |>
+  filter(CPD_UNIT_NO == UNIT_ID,
+         CONTACT_DATE >= SCOPE_START,
+         CONTACT_DATE <  SCOPE_END)
+
+message("  Stops in scope: ", nrow(SCOPE))
+```
+
+---
+
+# Section 6: Build officer co-event network
+
+Pivot to long form (one row per officer-stop), then build node and edge
+tables. Each stop is attributed to BOTH the FO and SO if both are
+present.
+
+```{r s10-build-network}
+SCOPE_LONG <- SCOPE |>
+  select(CARD_NO, IMPUTED_EVENT_ID, CONTACT_DATE,
+         FO_EMPLOYEE_ID, SO_EMPLOYEE_ID,
+         SEARCHED, HIT, RACE) |>
+  pivot_longer(c(FO_EMPLOYEE_ID, SO_EMPLOYEE_ID),
+               names_to = "ROLE", values_to = "OFFICER_ID") |>
+  filter(!is.na(OFFICER_ID), OFFICER_ID != "")
+
+NODES <- SCOPE_LONG |>
+  group_by(OFFICER_ID) |>
+  summarise(N_STOPS    = n(),
+            FIRST_SEEN = min(CONTACT_DATE),
+            LAST_SEEN  = max(CONTACT_DATE),
+            .groups    = "drop") |>
+  mutate(TIER = if_else(N_STOPS >= CORE_MIN, "core", "bridge"))
+
+message("  Officers: ", nrow(NODES),
+        " (core: ", sum(NODES$TIER == "core"),
+        ", bridge: ", sum(NODES$TIER == "bridge"), ")")
+
+# Multi-officer events drive edges
+EVENTS <- SCOPE_LONG |>
+  group_by(IMPUTED_EVENT_ID) |>
+  summarise(EVENT_TIME = min(CONTACT_DATE),
+            N_OFFICERS = n_distinct(OFFICER_ID),
+            .groups    = "drop") |>
+  filter(N_OFFICERS >= 2)
+
+# Each multi-officer event yields one row per officer pair (alphabetical)
+EDGE_CONTRIBS <- SCOPE_LONG |>
+  semi_join(EVENTS, by = "IMPUTED_EVENT_ID") |>
+  select(IMPUTED_EVENT_ID, OFFICER_ID) |>
+  distinct() |>
+  inner_join(
+    SCOPE_LONG |> semi_join(EVENTS, by = "IMPUTED_EVENT_ID") |>
+      select(IMPUTED_EVENT_ID, OFFICER_ID) |> distinct(),
+    by = "IMPUTED_EVENT_ID",
+    suffix = c("_FROM", "_TO"),
+    relationship = "many-to-many"
+  ) |>
+  filter(OFFICER_ID_FROM < OFFICER_ID_TO) |>
+  rename(FROM = OFFICER_ID_FROM, TO = OFFICER_ID_TO) |>
+  left_join(EVENTS |> select(IMPUTED_EVENT_ID, EVENT_TIME),
+            by = "IMPUTED_EVENT_ID")
+
+message("  Multi-officer events: ", nrow(EVENTS))
+message("  Edge contributions:   ", nrow(EDGE_CONTRIBS))
+```
+
+---
+
+# Section 7: Build per-officer-per-stop scope table
+
+This is the table the Shiny app uses to compute per-officer hit rate,
+search rate, racial breakdowns, and stop counts within any brushed
+time window. One row per (officer, stop), so a stop with two officers
+appears twice — once attributed to each officer.
+
+```{r s11-scope-for-shiny}
+SCOPE_FOR_SHINY <- SCOPE_LONG |>
+  select(OFFICER_ID, CARD_NO, IMPUTED_EVENT_ID, CONTACT_DATE,
+         SEARCHED, HIT, RACE) |>
+  arrange(CONTACT_DATE)
+
+message("  SCOPE_FOR_SHINY rows (officer-stop pairs): ", nrow(SCOPE_FOR_SHINY))
+```
+
+---
+
+# Section 8: Save consolidated .rds
+
+```{r s12-save}
+saveRDS(
+  list(
+    NODES           = NODES,
+    EDGE_CONTRIBS   = EDGE_CONTRIBS,
+    SCOPE_FOR_SHINY = SCOPE_FOR_SHINY
+  ),
+  file = file.path(DIR_SHINY, "data.rds")
+)
+
+message("Wrote ", file.path(DIR_SHINY, "data.rds"))
+```
+
+```{r s13-summary}
+list(
+  unit               = UNIT_ID,
+  window             = paste(format(SCOPE_START), "to", format(SCOPE_END)),
+  stops              = nrow(SCOPE),
+  officers           = nrow(NODES),
+  officers_core      = sum(NODES$TIER == "core"),
+  officers_bridge    = sum(NODES$TIER == "bridge"),
+  events_multi       = nrow(EVENTS),
+  edge_contribs      = nrow(EDGE_CONTRIBS),
+  scope_for_shiny    = nrow(SCOPE_FOR_SHINY),
+  edge_duration_days = EDGE_DURATION_DAYS
+) |> str()
+```

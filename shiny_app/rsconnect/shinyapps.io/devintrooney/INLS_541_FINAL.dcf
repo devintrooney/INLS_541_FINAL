@@ -1,0 +1,13 @@
+name: INLS_541_FINAL
+title: INLS_541_FINAL
+username: devintrooney
+account: devintrooney
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 17265427
+bundleId: 11930669
+url: https://devintrooney.shinyapps.io/INLS_541_FINAL/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: app_v1.R
